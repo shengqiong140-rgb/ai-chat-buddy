@@ -226,8 +226,13 @@ def speak_edge(text: str):
     except Exception:
         speak_say(text)  # 断网退回 macOS say
 
+def remove_emoji(text: str) -> str:
+    """去掉 emoji 和特殊符号，避免 TTS 读出来"""
+    return re.sub(r'[\U00010000-\U0010ffff\u2600-\u27BF\u2B50\u23CF-\u23FA\u200d\uFE0F\u2702-\u27B0\u2934\u2935]', '', text).strip()
+
 def speak(text: str):
-    if not text.strip():
+    text = remove_emoji(text)
+    if not text:
         return
     if args.tts_engine == "say":
         speak_say(text)
