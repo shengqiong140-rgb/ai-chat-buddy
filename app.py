@@ -26,7 +26,9 @@ console = Console()
 
 # ==================== 参数解析 ====================
 parser = argparse.ArgumentParser(description="本地语音助手 - 连续对话模式")
-parser.add_argument("--model", type=str, default="qwen2.5:14b", help="Ollama 模型名")
+parser.add_argument("--model", type=str, default="qwen3:14b", help="Ollama 模型名")
+parser.add_argument("--stt-engine", type=str, default="sensevoice", choices=["sensevoice", "whisper"],
+                    help="语音识别引擎: sensevoice=中英混合强, whisper=经典(回退用)")
 parser.add_argument("--whisper-model", type=str, default="medium", help="Whisper 模型 (tiny/base/small/medium)")
 parser.add_argument("--temperature", type=float, default=0.7, help="LLM temperature")
 parser.add_argument("--vad-aggressiveness", type=int, default=2, choices=[0, 1, 2, 3],
@@ -39,9 +41,33 @@ parser.add_argument("--tts-engine", type=str, default="edge", choices=["edge", "
                     help="TTS 引擎: edge=高音质(需网络), say=离线(macOS自带)")
 args = parser.parse_args()
 
-# ==================== 加载模型 ====================
-console.print("[cyan]正在加载 Whisper 模型...")
-stt = whisper.load_model(args.whisper_model)
+# ==================== 加载 STT 模型 ====================
+if args.stt_engine == "sensevoice":
+    from funasr import AutoModel
+    console.print("[cyan]正在加载 SenseVoice 模型...")
+    stt_model = AutoModel(model="iic/SenseVoiceSmall", trust_remote_code=True, device="cpu")
+
+    def transcribe_audio(audio_np):
+        """SenseVoice 转写：中英混合识别强"""
+        import tempfile, soundfile as sf
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as f:
+            sf.write(f.name, audio_np, SAMPLE_RATE)
+            result = stt_model.generate(input=f.name, language="auto", use_itn=True)
+        if result and len(result) > 0 and "text" in result[0]:
+            return result[0]["text"].strip(), "auto"
+        return "", "auto"
+else:
+    console.print("[cyan]正在加载 Whisper 模型...")
+    stt_model = whisper.load_model(args.whisper_model)
+
+    def transcribe_audio(audio_np):
+        """Whisper 转写"""
+        audio_padded = whisper.pad_or_trim(audio_np)
+        mel = whisper.log_mel_spectrogram(audio_padded).to(stt_model.device)
+        _, probs = stt_model.detect_language(mel)
+        lang = max(probs, key=probs.get)
+        result = stt_model.transcribe(audio_np, fp16=False, language=lang)
+        return result["text"].strip(), lang
 
 console.print(f"[cyan]连接 Ollama ({args.model})...")
 llm = OllamaLLM(model=args.model, base_url="http://localhost:11434")
@@ -167,20 +193,25 @@ def record_with_vad() -> np.ndarray | None:
 import asyncio
 import edge_tts
 
-EDGE_TTS_VOICE = "zh-CN-XiaoxiaoNeural"  # 中英混合都自然
+EDGE_TTS_VOICE_ZH = "zh-CN-XiaoxiaoNeural"  # 中文语音
+EDGE_TTS_VOICE_EN = "en-US-JennyNeural"     # 英文语音
+
+def _is_chinese(text: str) -> bool:
+    return bool(re.search(r'[\u4e00-\u9fa5]', text))
 
 def speak_say(text: str):
     """macOS say — 零延迟，全离线"""
-    voice = args.zh_voice if re.search(r'[\u4e00-\u9fa5]', text) else args.en_voice
+    voice = args.zh_voice if _is_chinese(text) else args.en_voice
     subprocess.run(["say", "-v", voice, text])
 
 def speak_edge(text: str):
-    """edge-tts — 高音质，中英混合自然"""
+    """edge-tts — 高音质，根据语言自动选声音"""
     try:
         out = "/tmp/migpt_tts.mp3"
+        voice = EDGE_TTS_VOICE_ZH if _is_chinese(text) else EDGE_TTS_VOICE_EN
 
         async def _tts():
-            tts = edge_tts.Communicate(text, EDGE_TTS_VOICE)
+            tts = edge_tts.Communicate(text, voice)
             await tts.save(out)
 
         asyncio.run(_tts())
@@ -203,7 +234,7 @@ if __name__ == "__main__":
     console.print("[cyan]🤖 本地语音助手 — 连续对话模式")
     console.print("[cyan]━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     console.print(f"[blue]模型: {args.model}")
-    console.print(f"[blue]Whisper: {args.whisper_model}")
+    console.print(f"[blue]语音识别: {args.stt_engine}" + (f" ({args.whisper_model})" if args.stt_engine == "whisper" else ""))
     console.print(f"[blue]VAD 灵敏度: {args.vad_aggressiveness}")
     console.print(f"[blue]静音停顿: {args.silence_duration}s")
     console.print("[cyan]━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
@@ -220,16 +251,10 @@ if __name__ == "__main__":
                 # 太短的音频忽略（<0.3秒）
                 continue
 
-            # 2. Whisper 语音转文字
+            # 2. 语音转文字
             with console.status("[bold cyan]识别中...", spinner="dots"):
-                # 先检测语言，再用对应语言转写，提高准确率
-                audio_padded = whisper.pad_or_trim(audio_np)
-                mel = whisper.log_mel_spectrogram(audio_padded).to(stt.device)
-                _, probs = stt.detect_language(mel)
-                lang = max(probs, key=probs.get)
-                result = stt.transcribe(audio_np, fp16=False, language=lang)
-                text = result["text"].strip()
-                console.print(f"[dim](语言: {lang})[/dim]")
+                text, lang = transcribe_audio(audio_np)
+                console.print(f"[dim]({args.stt_engine} | {lang})[/dim]")
 
             if not text:
                 continue
@@ -242,6 +267,8 @@ if __name__ == "__main__":
                     {"input": text},
                     config={"session_id": "voice_session"}
                 ).strip()
+                # 去掉 qwen3 的 <think>...</think> 思考标签
+                response = re.sub(r'<think>.*?</think>', '', response, flags=re.DOTALL).strip()
 
             console.print(f"[cyan]AI: {response}")
 
