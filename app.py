@@ -143,7 +143,7 @@ def record_with_vad() -> np.ndarray | None:
         dtype="float32",
         blocksize=FRAME_SIZE * 4,  # 处理多个帧
         callback=callback,
-        device=0,  # AirPods 麦克风
+        device=None,  # 自动选择默认麦克风
     ):
         # 等待语音触发
         while not triggered:
