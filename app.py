@@ -163,13 +163,20 @@ def record_with_vad() -> np.ndarray | None:
                 else:
                     silence_frames += 1
 
+    # 自动找到第一个有输入通道的设备
+    input_device = None
+    for i, dev in enumerate(sd.query_devices()):
+        if dev['max_input_channels'] > 0:
+            input_device = i
+            break
+
     with sd.InputStream(
         samplerate=SAMPLE_RATE,
         channels=1,
         dtype="float32",
-        blocksize=FRAME_SIZE * 4,  # 处理多个帧
+        blocksize=FRAME_SIZE * 4,
         callback=callback,
-        device=None,  # 自动选择默认麦克风
+        device=input_device,
     ):
         # 等待语音触发
         while not triggered:
